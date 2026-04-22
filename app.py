@@ -6,46 +6,46 @@ from collections import defaultdict
 
 app = Flask(__name__)
 
+# Стоп-слова и города, которые нужно игнорировать
+STOP_WORDS = [
+    'дата', 'время', 'место', 'команда', 'игрок', 'судья', 'город',
+    'Москва', 'Сухум', 'Майкоп', 'Кострома', 'Ижевск', 'Ставрополь', 
+    'Воронеж', 'Ростов', 'Грозный', 'Гудаута', 'Москва', 'Санкт-Петербург'
+]
+
+def is_valid_team_name(text):
+    """Проверяет, является ли текст названием команды"""
+    text = text.strip()
+    if len(text) < 5:  # Слишком короткое
+        return False
+    if text.lower() in STOP_WORDS:
+        return False
+    # Должно содержать буквы
+    if not re.search(r'[а-яА-Яa-zA-Z]', text):
+        return False
+    # Не должно быть только цифр
+    if text.isdigit():
+        return False
+    return True
+
 def clean_team_name(text):
     """Очищает название команды от мусора"""
+    # Убираем номера
     text = re.sub(r'^\d+[-]?[йяе]?\s*', '', text)
     text = re.sub(r'\s*\d+[-]?[йяе]?\s*$', '', text)
+    # Убираем времена
     text = re.sub(r'\d{1,2}[:\.]\d{2}\s*(?:MCK|МСК|MSK)?', '', text)
+    # Убираем даты
     text = re.sub(r'\d{1,2}\.\d{1,2}\.\d{4}', '', text)
+    # Убираем одиночные числа
     text = re.sub(r'\b\d+\b', '', text)
-    garbage = ['МСК', 'MCK', 'MSK', 'дата', 'time', 'date', 'время', '№', 'круг', 'тур', 'Время', 'местное', 'место', 'команда', 'игрок']
+    # Убираем мусорные слова
+    garbage = ['МСК', 'MCK', 'MSK', '№', 'круг', 'тур', 'Время', 'местное', 'главный']
     for g in garbage:
         text = text.replace(g, '')
-    text = re.sub(r'[^\w\s\u0400-\u04FF]', '', text)
+    # Убираем лишние пробелы
     text = re.sub(r'\s+', ' ', text)
     return text.strip()
-
-def calculate_ball_handicap(home_balls_won, home_balls_lost, away_balls_won, away_balls_lost, is_neutral=False):
-    """Рассчитывает фору по мячам (очкам)"""
-    if not all([home_balls_won, home_balls_lost, away_balls_won, away_balls_lost]):
-        return None
-    
-    # Среднее количество очков за матч
-    home_avg = home_balls_won / home_balls_lost if home_balls_lost > 0 else 1
-    away_avg = away_balls_won / away_balls_lost if away_balls_lost > 0 else 1
-    
-    # Соотношение сил
-    strength_ratio = home_avg / away_avg
-    
-    # Базовая фора (в очках)
-    base_handicap = (strength_ratio - 1) * 25
-    
-    # Корректировка на домашнюю площадку
-    if not is_neutral:
-        base_handicap += 2.5
-    
-    # Округляем до 0.5
-    handicap = round(base_handicap * 2) / 2
-    
-    # Ограничиваем диапазон
-    handicap = max(-15.5, min(15.5, handicap))
-    
-    return handicap
 
 def parse_tournament_table(url):
     """Парсит турнирную таблицу и все матчи"""
@@ -55,6 +55,8 @@ def parse_tournament_table(url):
         response.raise_for_status()
         
         soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # Находим все таблицы
         tables = soup.find_all('table')
         
         if not tables:
@@ -63,16 +65,18 @@ def parse_tournament_table(url):
         teams_stats = {}
         team_names_set = set()
         
-        # Находим все названия команд
+        # Сначала находим все названия команд из таблицы
         for table in tables:
             rows = table.find_all('tr')
             for row in rows:
                 cols = row.find_all('td')
-                if len(cols) >= 2:
-                    for idx, col in enumerate(cols[:3]):
+                if len(cols) >= 3:
+                    # Проверяем первые 3 колонки на наличие названия команды
+                    for col in cols[:3]:
                         text = col.get_text(strip=True)
-                        if len(text) < 2:
+                        if len(text) < 3:
                             continue
+                        # Пропускаем явные числа и даты
                         if re.match(r'^\d+$', text):
                             continue
                         if re.match(r'^\d{1,2}[:\.]\d{2}$', text):
@@ -80,12 +84,20 @@ def parse_tournament_table(url):
                         if re.search(r'МСК|MCK', text):
                             continue
                         
+                        # Пропускаем слишком короткие строки
+                        if len(text) < 4:
+                            continue
+                        
                         clean = clean_team_name(text)
-                        if len(clean) > 2 and not clean.isdigit():
-                            if clean.lower() not in ['дата', 'время', 'место', 'команда']:
+                        
+                        # Проверяем, что это похоже на название команды
+                        if len(clean) > 4 and not clean.isdigit() and clean.lower() not in STOP_WORDS:
+                            # Убираем одиночные буквы в конце
+                            clean = re.sub(r'\s+[А-Яа-я]$', '', clean)
+                            if len(clean) > 3:
                                 team_names_set.add(clean)
         
-        # Инициализируем статистику
+        # Инициализируем статистику для каждой команды
         for name in team_names_set:
             teams_stats[name] = {
                 'name': name,
@@ -96,7 +108,7 @@ def parse_tournament_table(url):
                 'matches': 0
             }
         
-        # Парсим матчи для сбора статистики
+        # Парсим все строки для сбора статистики
         for table in tables:
             rows = table.find_all('tr')
             for row in rows:
@@ -107,16 +119,24 @@ def parse_tournament_table(url):
                     # Ищем команды в строке
                     teams_in_row = []
                     for team in team_names_set:
+                        # Ищем полное название команды
                         if team.lower() in row_text.lower():
                             teams_in_row.append(team)
+                        # Ищем сокращённое название (часть команды)
+                        elif len(team) > 8 and team.split()[0].lower() in row_text.lower():
+                            teams_in_row.append(team)
                     
+                    # Убираем дубликаты
+                    teams_in_row = list(set(teams_in_row))
+                    
+                    # Если нашли 2 команды - это матч
                     if len(teams_in_row) == 2:
                         team1, team2 = teams_in_row[0], teams_in_row[1]
                         
                         # Ищем счета партий
                         set_matches = re.findall(r'(\d)[:-](\d)', row_text)
                         # Ищем очки
-                        ball_matches = re.findall(r'(\d{1,3})[:-](\d{1,3})', row_text)
+                        ball_matches = re.findall(r'(\d{2,3})[:-](\d{2,3})', row_text)
                         
                         # Партии
                         sets1 = 0
@@ -149,12 +169,13 @@ def parse_tournament_table(url):
                             teams_stats[team2]['balls_won'] += balls2
                             teams_stats[team2]['balls_lost'] += balls1
         
-        # Формируем результат
+        # Формируем результат - только команды с данными
         result_teams = {}
         team_names = []
         
         for name, stats in teams_stats.items():
-            if stats['balls_won'] == 0 and stats['sets_won'] == 0:
+            # Пропускаем команды без данных
+            if stats['matches'] == 0 and stats['balls_won'] == 0:
                 continue
             
             result_teams[name] = {
@@ -174,6 +195,25 @@ def parse_tournament_table(url):
         
     except Exception as e:
         return None, str(e), []
+
+def calculate_ball_handicap(home_balls_won, home_balls_lost, away_balls_won, away_balls_lost, is_neutral=False):
+    """Рассчитывает фору по мячам (очкам)"""
+    if not all([home_balls_won, home_balls_lost, away_balls_won, away_balls_lost]):
+        return None
+    
+    home_avg = home_balls_won / home_balls_lost if home_balls_lost > 0 else 1
+    away_avg = away_balls_won / away_balls_lost if away_balls_lost > 0 else 1
+    
+    strength_ratio = home_avg / away_avg
+    base_handicap = (strength_ratio - 1) * 25
+    
+    if not is_neutral:
+        base_handicap += 2.5
+    
+    handicap = round(base_handicap * 2) / 2
+    handicap = max(-15.5, min(15.5, handicap))
+    
+    return handicap
 
 HTML_TEMPLATE = '''
 <!DOCTYPE html>
@@ -487,7 +527,6 @@ HTML_TEMPLATE = '''
                     </div>
                 </div>
                 
-                <!-- Фора по мячам -->
                 <div class="result-card handicap-card" style="margin-top: 15px;">
                     <div class="label">🏐 ФОРА ПО МЯЧАМ (ОЧКАМ)</div>
                     <div class="value" id="handicap">-</div>
@@ -558,6 +597,7 @@ HTML_TEMPLATE = '''
                     <span style="font-size: 0.8em; color: #666;">`;
                 if (data.balls_won) html += `🎯 Очки: ${data.balls_won}:${data.balls_lost} `;
                 if (data.sets_won) html += `🏆 Сеты: ${data.sets_won}:${data.sets_lost}`;
+                if (data.matches) html += ` 📊 Матчей: ${data.matches}`;
                 html += `</span></div>`;
             }
             container.innerHTML = html;
@@ -612,6 +652,9 @@ HTML_TEMPLATE = '''
             if (data.sets_won && data.sets_lost) {
                 statsHtml += `<div class="stats-item">🏆 Сеты: ${data.sets_won}:${data.sets_lost}</div>`;
             }
+            if (data.matches) {
+                statsHtml += `<div class="stats-item">📊 Сыграно матчей: ${data.matches}</div>`;
+            }
             statsDiv.innerHTML = statsHtml;
             statsDiv.classList.add('show');
         }
@@ -665,12 +708,10 @@ HTML_TEMPLATE = '''
             
             let homeAvg = homeBallsWon / homeBallsLost;
             let awayAvg = awayBallsWon / awayBallsLost;
-            
             let strengthRatio = homeAvg / awayAvg;
             let handicap = (strengthRatio - 1) * 25;
             
             if (!isNeutral) handicap += 2.5;
-            
             handicap = Math.round(handicap * 2) / 2;
             handicap = Math.max(-15.5, Math.min(15.5, handicap));
             
@@ -726,21 +767,18 @@ HTML_TEMPLATE = '''
                 return;
             }
             
-            // Расчёт PR
             let prResult = null;
             let prAvailable = homeBallsWon && homeBallsLost && awayBallsWon && awayBallsLost;
             if (prAvailable) {
                 prResult = calculatePR(homeBallsWon, homeBallsLost, awayBallsWon, awayBallsLost, isNeutral);
             }
             
-            // Расчёт BT
             let btResult = null;
             let btAvailable = homeSetsWon && homeSetsLost && awaySetsWon && awaySetsLost;
             if (btAvailable) {
                 btResult = calculateBT(homeSetsWon, homeSetsLost, awaySetsWon, awaySetsLost, isNeutral);
             }
             
-            // Финальный результат
             let finalOdds = null;
             let finalProb = null;
             let totalUnder = false;
@@ -759,13 +797,11 @@ HTML_TEMPLATE = '''
                 finalProb = btResult.homeProb;
             }
             
-            // Расчёт форы по мячам
             let handicap = null;
             if (prAvailable) {
                 handicap = calculateHandicap(homeBallsWon, homeBallsLost, awayBallsWon, awayBallsLost, isNeutral);
             }
             
-            // Отображение
             document.getElementById('prOdds').textContent = prResult ? `${prResult.homeOdds} / ${prResult.awayOdds}` : '—';
             document.getElementById('prProb').textContent = prResult ? `${homeName}: ${prResult.homeProb}% | ${awayName}: ${prResult.awayProb}%` : 'Нет данных по очкам';
             document.getElementById('btOdds').textContent = btResult ? `${btResult.homeOdds} / ${btResult.awayOdds}` : '—';
@@ -773,20 +809,17 @@ HTML_TEMPLATE = '''
             document.getElementById('finalOdds').textContent = finalOdds ? `${finalOdds} / ${finalOdds ? Math.round((1/finalOdds*100/0.925) * 100) / 100 : '-'}` : '—';
             document.getElementById('finalProb').textContent = finalProb ? `${homeName}: ${finalProb}% | ${awayName}: ${Math.round((100-finalProb) * 10) / 10}%` : '—';
             
-            // Отображение форы
             if (handicap !== null) {
-                let handicapText = '';
                 if (handicap > 0) {
-                    handicapText = `${homeName} (${handicap}) : ${awayName} (${-handicap})`;
+                    document.getElementById('handicap').textContent = `${homeName} (${handicap}) : ${awayName} (${-handicap})`;
                     document.getElementById('handicapDesc').innerHTML = `🏠 ${homeName} фаворит на ${handicap} очков<br>✈️ ${awayName} андердог (+${-handicap})`;
                 } else if (handicap < 0) {
-                    handicapText = `${homeName} (${handicap}) : ${awayName} (${-handicap})`;
+                    document.getElementById('handicap').textContent = `${homeName} (${handicap}) : ${awayName} (${-handicap})`;
                     document.getElementById('handicapDesc').innerHTML = `🏠 ${homeName} андердог (${handicap})<br>✈️ ${awayName} фаворит на ${-handicap} очков`;
                 } else {
-                    handicapText = `${homeName} (0) : ${awayName} (0)`;
+                    document.getElementById('handicap').textContent = `${homeName} (0) : ${awayName} (0)`;
                     document.getElementById('handicapDesc').innerHTML = `⚖️ Равные команды, фора 0`;
                 }
-                document.getElementById('handicap').textContent = handicapText;
             } else {
                 document.getElementById('handicap').textContent = '—';
                 document.getElementById('handicapDesc').textContent = 'Нет данных для расчёта форы';
