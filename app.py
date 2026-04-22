@@ -2,57 +2,100 @@ from flask import Flask, request, jsonify, render_template_string
 import requests
 from bs4 import BeautifulSoup
 import re
+import math
 
 app = Flask(__name__)
 
 def clean_team_name(text):
     """Очищает название команды от мусора"""
-    # Убираем "-й", "-я", "-е" в начале
     text = re.sub(r'^\d+[-]?[йяе]?\s*', '', text)
-    # Убираем времена
+    text = re.sub(r'\s*\d+[-]?[йяе]?\s*$', '', text)
     text = re.sub(r'\d{1,2}[:\.]\d{2}\s*(?:MCK|МСК|MSK)?', '', text)
-    # Убираем даты
     text = re.sub(r'\d{1,2}\.\d{1,2}\.\d{4}', '', text)
-    # Убираем одиночные числа
     text = re.sub(r'\b\d+\b', '', text)
-    # Убираем слова-маркеры
-    garbage = ['МСК', 'MCK', 'MSK', 'дата', 'time', 'date', 'время', '№', 'круг', 'тур', 'Время', 'местное']
+    garbage = ['МСК', 'MCK', 'MSK', 'дата', 'time', 'date', 'время', '№', 'круг', 'тур', 'Время', 'местное', 'место']
     for g in garbage:
         text = text.replace(g, '')
-    # Убираем лишние пробелы и символы
-    text = re.sub(r'[^\w\s\u0400-\u04FF-]', '', text)
+    text = re.sub(r'[^\w\s\u0400-\u04FF]', '', text)
     text = re.sub(r'\s+', ' ', text)
     return text.strip()
 
+def calculate_pr_odds(balls_won, balls_lost, home_bonus=1.05):
+    """Расчёт коэффициента на основе очков (PR)"""
+    if balls_won is None or balls_lost is None or balls_lost == 0:
+        return None
+    
+    # Соотношение выигранных/проигранных очков
+    ratio = balls_won / balls_lost
+    
+    # Вероятность победы на основе очков
+    prob = ratio / (1 + ratio)
+    
+    # Применяем бонус домашней площадки
+    prob = prob * home_bonus
+    prob = min(0.95, max(0.05, prob))
+    
+    # Коэффициент с маржой 7.5%
+    margin = 0.075
+    odds = (1 / prob) * (1 - margin)
+    
+    return round(odds, 2), round(prob * 100, 1)
+
+def calculate_bt_odds(sets_won, sets_lost, home_bonus=1.03):
+    """Расчёт коэффициента на основе сетов (BT)"""
+    if sets_won is None or sets_lost is None or sets_lost == 0:
+        return None
+    
+    # Соотношение выигранных/проигранных сетов
+    ratio = sets_won / sets_lost
+    
+    # Вероятность победы на основе сетов (более консервативно)
+    prob = ratio / (1 + ratio)
+    
+    # Применяем бонус домашней площадки (меньше, чем для очков)
+    prob = prob * home_bonus
+    prob = min(0.95, max(0.05, prob))
+    
+    # Коэффициент с маржой 7.5%
+    margin = 0.075
+    odds = (1 / prob) * (1 - margin)
+    
+    return round(odds, 2), round(prob * 100, 1)
+
+def check_total_under(home_strength_pr, away_strength_pr, home_strength_bt, away_strength_bt):
+    """Проверка на тотал (выносной матч)"""
+    # Если разница в силе большая - тотал меньше
+    diff_pr = abs(home_strength_pr - away_strength_pr) if home_strength_pr and away_strength_pr else 0
+    diff_bt = abs(home_strength_bt - away_strength_bt) if home_strength_bt and away_strength_bt else 0
+    
+    if diff_pr > 40 or diff_bt > 35:
+        return True
+    return False
+
 def parse_tournament_table(url):
-    """Парсит турнирную таблицу и вычисляет силу команд"""
+    """Парсит турнирную таблицу для PR и BT"""
     try:
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
         response = requests.get(url, headers=headers, timeout=15)
         response.raise_for_status()
         
         soup = BeautifulSoup(response.text, 'html.parser')
-        
-        # Ищем все таблицы
         tables = soup.find_all('table')
         
         if not tables:
             return None, "Таблица не найдена", []
         
         teams_data = {}
-        max_points = 0
-        max_win_rate = 0
         
         for table in tables:
             rows = table.find_all('tr')
             
             for row in rows:
                 cols = row.find_all('td')
-                if len(cols) >= 6:
-                    # Ищем название команды
+                if len(cols) >= 4:
+                    # Поиск названия команды
                     team_name = None
-                    
-                    for idx, col in enumerate(cols[:4]):
+                    for idx, col in enumerate(cols[:3]):
                         text = col.get_text(strip=True)
                         if len(text) < 2:
                             continue
@@ -60,102 +103,54 @@ def parse_tournament_table(url):
                             continue
                         if re.match(r'^\d{1,2}[:\.]\d{2}$', text):
                             continue
-                        if re.search(r'МСК|MCK', text):
-                            continue
-                        
                         clean = clean_team_name(text)
-                        # Пропускаем короткие и пустые
                         if len(clean) > 2 and not clean.isdigit():
-                            team_name = clean
-                            break
+                            if clean.lower() not in ['дата', 'время', 'место', 'команда']:
+                                team_name = clean
+                                break
                     
                     if not team_name:
                         continue
                     
-                    # Собираем всю строку для поиска чисел
+                    if team_name in teams_data:
+                        continue
+                    
+                    # Собираем всю строку
                     row_text = ' '.join([c.get_text(strip=True) for c in cols])
                     
-                    # Ищем очки (обычно большое число)
-                    points = None
-                    points_matches = re.findall(r'\b(\d{2,3})\b', row_text)
-                    for p in points_matches:
-                        val = int(p)
-                        if 20 <= val <= 150:  # Диапазон очков в волейболе
-                            points = val
-                            if points > max_points:
-                                max_points = points
-                            break
-                    
-                    # Ищем партии (формат 89:31 или 89-31)
+                    # Поиск мячей (очков) - формат 89:31 или 89-31
+                    balls_won = None
+                    balls_lost = None
                     sets_won = None
                     sets_lost = None
-                    sets_match = re.search(r'(\d+)[:-](\d+)', row_text)
-                    if sets_match:
-                        sets_won = int(sets_match.group(1))
-                        sets_lost = int(sets_match.group(2))
                     
-                    # Ищем победы/поражения
-                    wins = None
-                    losses = None
-                    win_loss = re.search(r'(\d+)[^\d]+(\d+)\s*(?:в|п|w|l)', row_text, re.I)
-                    if win_loss:
-                        wins = int(win_loss.group(1))
-                        losses = int(win_loss.group(2))
+                    # Ищем все пары чисел
+                    matches = re.findall(r'(\d+)[:-](\d+)', row_text)
+                    
+                    for w, l in matches:
+                        w_int = int(w)
+                        l_int = int(l)
+                        # Мячи обычно в диапазоне 20-150
+                        if 20 <= w_int <= 200 and 20 <= l_int <= 200:
+                            balls_won = w_int
+                            balls_lost = l_int
+                        # Сеты обычно 0-5
+                        elif w_int <= 5 and l_int <= 5:
+                            sets_won = w_int
+                            sets_lost = l_int
                     
                     teams_data[team_name] = {
                         'name': team_name,
-                        'points': points,
+                        'balls_won': balls_won,
+                        'balls_lost': balls_lost,
                         'sets_won': sets_won,
-                        'sets_lost': sets_lost,
-                        'wins': wins,
-                        'losses': losses
+                        'sets_lost': sets_lost
                     }
         
-        # Вычисляем силу для каждой команды
-        for team in teams_data:
-            strength = 50  # по умолчанию
-            data = teams_data[team]
-            
-            # Приоритет 1: очки
-            if data['points'] and max_points > 0:
-                strength = (data['points'] / max_points) * 100
-            
-            # Приоритет 2: соотношение партий
-            elif data['sets_won'] and data['sets_lost'] and data['sets_lost'] > 0:
-                sets_ratio = (data['sets_won'] / data['sets_lost']) * 100
-                strength = min(100, sets_ratio)
-            
-            # Приоритет 3: победы/поражения
-            elif data['wins'] and data['losses'] and (data['wins'] + data['losses']) > 0:
-                win_rate = (data['wins'] / (data['wins'] + data['losses'])) * 100
-                strength = win_rate
-            
-            data['strength'] = round(strength, 1)
-        
-        # Сортируем по силе
-        sorted_teams = sorted(teams_data.items(), key=lambda x: x[1]['strength'], reverse=True)
-        
-        result_teams = {}
-        team_names = []
-        
-        for name, data in sorted_teams:
-            # Пропускаем явно некорректные названия
-            if len(name) < 2 or name.lower() in ['дата', 'время', 'место', 'команда']:
-                continue
-            result_teams[name] = {
-                'strength': data['strength'],
-                'points': data.get('points'),
-                'sets_won': data.get('sets_won'),
-                'sets_lost': data.get('sets_lost'),
-                'wins': data.get('wins'),
-                'losses': data.get('losses')
-            }
-            team_names.append(name)
-        
-        if not result_teams:
+        if not teams_data:
             return None, "Не удалось распознать команды", []
         
-        return result_teams, None, team_names
+        return teams_data, None, list(teams_data.keys())
         
     except Exception as e:
         return None, str(e), []
@@ -165,7 +160,7 @@ HTML_TEMPLATE = '''
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
-    <title>Volley Odds - Точный расчёт</title>
+    <title>Volley Odds - PR+BT | Shtopor</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -190,6 +185,13 @@ HTML_TEMPLATE = '''
             text-align: center;
         }
         .header h1 { font-size: 2.5em; margin-bottom: 10px; }
+        .badge {
+            display: inline-block;
+            background: rgba(255,255,255,0.2);
+            padding: 5px 15px;
+            border-radius: 20px;
+            font-size: 0.9em;
+        }
         .content { padding: 30px; }
         .section {
             background: #f8f9fa;
@@ -227,37 +229,6 @@ HTML_TEMPLATE = '''
             cursor: pointer;
             font-weight: bold;
         }
-        .parsed-data {
-            background: white;
-            padding: 15px;
-            border-radius: 8px;
-            margin-top: 15px;
-            display: none;
-            max-height: 300px;
-            overflow-y: auto;
-        }
-        .parsed-data.active { display: block; }
-        .team-row {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            padding: 8px;
-            border-bottom: 1px solid #e0e0e0;
-        }
-        .team-row:last-child { border-bottom: none; }
-        .strength-bar {
-            flex: 1;
-            margin: 0 15px;
-            height: 8px;
-            background: #e0e0e0;
-            border-radius: 4px;
-            overflow: hidden;
-        }
-        .strength-fill {
-            height: 100%;
-            border-radius: 4px;
-            transition: width 0.5s;
-        }
         .team-selector {
             display: grid;
             grid-template-columns: 1fr 1fr;
@@ -276,33 +247,23 @@ HTML_TEMPLATE = '''
             margin-bottom: 10px;
             color: #555;
         }
-        select {
+        select, input {
             width: 100%;
-            padding: 12px;
+            padding: 10px;
             border: 2px solid #e0e0e0;
             border-radius: 8px;
             font-size: 1em;
-            background: white;
-            cursor: pointer;
         }
-        .team-stats {
-            margin-top: 10px;
-            padding: 10px;
-            background: #f0f0f0;
-            border-radius: 8px;
-            font-size: 0.85em;
-            display: none;
+        .stats-input {
+            margin-top: 15px;
         }
-        .team-stats.show {
-            display: block;
-        }
-        .stats-item {
-            margin: 5px 0;
-            color: #333;
+        .stats-input input {
+            margin-bottom: 10px;
         }
         .options {
             display: flex;
             gap: 20px;
+            flex-wrap: wrap;
             margin-bottom: 25px;
         }
         .checkbox-label {
@@ -332,18 +293,64 @@ HTML_TEMPLATE = '''
             text-align: center;
             display: none;
         }
-        .odds-grid {
-            display: grid;
-            grid-template-columns: repeat(3, 1fr);
-            gap: 20px;
-            margin-top: 20px;
-        }
-        .odds-card {
-            background: rgba(255,255,255,0.2);
+        .result h3 { font-size: 1.5em; margin-bottom: 20px; }
+        .result-card {
+            background: rgba(255,255,255,0.15);
             padding: 20px;
             border-radius: 12px;
+            margin-bottom: 15px;
         }
-        .odds-card .value { font-size: 2em; font-weight: bold; }
+        .result-card .label {
+            font-size: 0.85em;
+            opacity: 0.8;
+            margin-bottom: 5px;
+        }
+        .result-card .value {
+            font-size: 2em;
+            font-weight: bold;
+        }
+        .result-card .small {
+            font-size: 0.9em;
+            margin-top: 5px;
+        }
+        .final-result {
+            background: rgba(255,215,0,0.2);
+            border: 2px solid gold;
+        }
+        .manual-stats {
+            display: none;
+        }
+        .manual-stats.active {
+            display: block;
+        }
+        .parsed-data {
+            background: white;
+            padding: 15px;
+            border-radius: 8px;
+            margin-top: 15px;
+            display: none;
+            max-height: 300px;
+            overflow-y: auto;
+        }
+        .parsed-data.active { display: block; }
+        .team-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 8px;
+            border-bottom: 1px solid #e0e0e0;
+        }
+        .team-row:last-child { border-bottom: none; }
+        .team-stats {
+            margin-top: 10px;
+            padding: 10px;
+            background: #f0f0f0;
+            border-radius: 8px;
+            font-size: 0.85em;
+            display: none;
+        }
+        .team-stats.show { display: block; }
+        .stats-item { margin: 5px 0; color: #333; }
         .loading {
             display: inline-block;
             width: 20px;
@@ -363,13 +370,14 @@ HTML_TEMPLATE = '''
         }
         .status.success { background: #d4edda; color: #155724; }
         .status.error { background: #f8d7da; color: #721c24; }
+        .status.info { background: #d1ecf1; color: #0c5460; }
         .empty-state {
             text-align: center;
             padding: 40px;
             color: #999;
         }
         @media (max-width: 768px) {
-            .team-selector, .odds-grid { grid-template-columns: 1fr; }
+            .team-selector { grid-template-columns: 1fr; }
             .url-input-group { flex-direction: column; }
         }
     </style>
@@ -378,56 +386,93 @@ HTML_TEMPLATE = '''
     <div class="container">
         <div class="header">
             <h1>🏐 Volley Odds by Shtopor</h1>
-            <div>Расчёт на основе очков и партий</div>
+            <div class="badge">PR+BT | Professional Betting Tool</div>
         </div>
         <div class="content">
+            <!-- Ссылка на турнирную таблицу -->
             <div class="section">
                 <div class="section-title">🔗 Ссылка на турнирную таблицу</div>
                 <div class="url-input-group">
                     <input type="url" id="tableUrl" placeholder="https://volley.ru/calendar/...">
-                    <button id="parseBtn">📊 Загрузить команды</button>
+                    <button id="parseBtn">📊 Загрузить данные</button>
                 </div>
                 <div id="parsedData" class="parsed-data"></div>
                 <div id="status"></div>
             </div>
 
+            <!-- Ручной ввод -->
+            <div class="section">
+                <div class="section-title">✏️ Ручной ввод статистики</div>
+                <button id="manualStatsBtn" style="background: #28a745; width: auto; padding: 10px 20px;">📝 Ввести статистику вручную</button>
+                <div id="manualStats" class="manual-stats">
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-top: 15px;">
+                        <div>
+                            <label style="font-weight: bold;">🏠 Хозяева:</label>
+                            <input type="text" id="homeName" placeholder="Название команды" value="Хозяева">
+                            <input type="number" id="homeSetsWon" placeholder="Выигранные сеты" value="">
+                            <input type="number" id="homeSetsLost" placeholder="Проигранные сеты" value="">
+                            <input type="number" id="homeBallsWon" placeholder="Выигранные очки" value="">
+                            <input type="number" id="homeBallsLost" placeholder="Проигранные очки" value="">
+                        </div>
+                        <div>
+                            <label style="font-weight: bold;">✈️ Гости:</label>
+                            <input type="text" id="awayName" placeholder="Название команды" value="Гости">
+                            <input type="number" id="awaySetsWon" placeholder="Выигранные сеты" value="">
+                            <input type="number" id="awaySetsLost" placeholder="Проигранные сеты" value="">
+                            <input type="number" id="awayBallsWon" placeholder="Выигранные очки" value="">
+                            <input type="number" id="awayBallsLost" placeholder="Проигранные очки" value="">
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Выбор команд из таблицы -->
             <div class="section" id="teamsSection">
-                <div class="section-title">🏟️ Выберите команды</div>
+                <div class="section-title">🏟️ Выберите команды из таблицы</div>
                 <div id="teamSelectorsContainer">
                     <div class="empty-state">
                         ⚡ Загрузите турнирную таблицу<br>
                         Команды появятся здесь
                     </div>
                 </div>
-                <div class="options" id="optionsPanel" style="display: none;">
+            </div>
+
+            <!-- Настройки -->
+            <div class="section">
+                <div class="section-title">⚙️ Настройки</div>
+                <div class="options">
                     <label class="checkbox-label">
                         <input type="checkbox" id="neutralVenue"> 🏟️ Нейтральная площадка
+                    </label>
+                    <label class="checkbox-label">
+                        <input type="checkbox" id="useManual"> 📊 Использовать ручной ввод
                     </label>
                 </div>
             </div>
 
-            <button id="calculateBtn" style="display: none;" onclick="calculateOdds()">🎯 Рассчитать котировки</button>
+            <button id="calculateBtn" onclick="calculateOdds()">🎯 Рассчитать котировки</button>
 
             <div id="result" class="result">
                 <h3>📈 Результат расчёта</h3>
-                <div class="odds-grid">
-                    <div class="odds-card">
-                        <div>🏠 Победа хозяев</div>
-                        <div class="value" id="homeOdds">-</div>
-                        <div id="homeProb">-</div>
+                <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 20px;">
+                    <div class="result-card">
+                        <div class="label">PR (Личные очки)</div>
+                        <div class="value" id="prOdds">-</div>
+                        <div class="small" id="prProb">-</div>
                     </div>
-                    <div class="odds-card">
-                        <div>🤝 Тотал (3+ сета)</div>
-                        <div class="value" id="drawOdds">-</div>
-                        <div id="drawProb">-</div>
+                    <div class="result-card">
+                        <div class="label">BT (Сеты)</div>
+                        <div class="value" id="btOdds">-</div>
+                        <div class="small" id="btProb">-</div>
                     </div>
-                    <div class="odds-card">
-                        <div>✈️ Победа гостей</div>
-                        <div class="value" id="awayOdds">-</div>
-                        <div id="awayProb">-</div>
+                    <div class="result-card final-result">
+                        <div class="label">⭐ FINAL RESULT</div>
+                        <div class="value" id="finalOdds">-</div>
+                        <div class="small" id="finalProb">-</div>
                     </div>
                 </div>
-                <div style="margin-top: 20px;">
+                <div id="totalInfo" style="margin-top: 15px; padding: 10px; background: rgba(255,255,255,0.1); border-radius: 8px;"></div>
+                <div style="margin-top: 15px;">
                     🔥 Маржа: 7.5%<br>
                     ⭐ Рекомендация: <span id="recommendation">-</span>
                 </div>
@@ -470,7 +515,7 @@ HTML_TEMPLATE = '''
             } catch (err) {
                 showStatus('❌ Ошибка: ' + err.message, 'error');
             } finally {
-                btn.innerHTML = '📊 Загрузить команды';
+                btn.innerHTML = '📊 Загрузить данные';
                 btn.disabled = false;
             }
         }
@@ -483,22 +528,14 @@ HTML_TEMPLATE = '''
                 return;
             }
             
-            let html = '<div style="font-weight: bold; margin-bottom: 15px;">📊 Рейтинг команд:</div>';
-            let rank = 1;
-            
+            let html = '<div style="font-weight: bold; margin-bottom: 15px;">📊 Данные из таблицы:</div>';
             for (const [name, data] of Object.entries(teams)) {
-                const strength = data.strength;
-                let color = strength > 70 ? '#28a745' : (strength > 40 ? '#ffc107' : '#dc3545');
-                html += `
-                    <div class="team-row">
-                        <span style="min-width: 180px;"><strong>${rank}.</strong> ${name}</span>
-                        <div class="strength-bar">
-                            <div class="strength-fill" style="width: ${strength}%; background: ${color}"></div>
-                        </div>
-                        <span style="min-width: 45px;">${strength}%</span>
-                    </div>
-                `;
-                rank++;
+                html += `<div class="team-row">
+                    <span style="min-width: 200px;">🏐 ${name}</span>
+                    <span style="font-size: 0.8em; color: #666;">`;
+                if (data.balls_won) html += `🎯 Очки: ${data.balls_won}:${data.balls_lost} `;
+                if (data.sets_won) html += `🏆 Сеты: ${data.sets_won}:${data.sets_lost}`;
+                html += `</span></div>`;
             }
             container.innerHTML = html;
             container.classList.add('active');
@@ -506,9 +543,6 @@ HTML_TEMPLATE = '''
 
         function createTeamSelectors(teams, teamNames) {
             const container = document.getElementById('teamSelectorsContainer');
-            const optionsPanel = document.getElementById('optionsPanel');
-            const calculateBtn = document.getElementById('calculateBtn');
-            
             if (!teamNames || teamNames.length < 2) {
                 container.innerHTML = '<div class="empty-state">⚠️ Нужно минимум 2 команды</div>';
                 return;
@@ -535,16 +569,13 @@ HTML_TEMPLATE = '''
                 </div>
             `;
             
-            optionsPanel.style.display = 'block';
-            calculateBtn.style.display = 'block';
-            
-            // Показываем статистику для выбранных команд
             showTeamStats('home');
             showTeamStats('away');
         }
 
         function showTeamStats(side) {
             const select = document.getElementById(`${side}Team`);
+            if (!select) return;
             const statsDiv = document.getElementById(`${side}Stats`);
             const teamName = select.value;
             const data = teamsData[teamName];
@@ -552,70 +583,177 @@ HTML_TEMPLATE = '''
             if (!data) return;
             
             let statsHtml = '';
-            if (data.points) statsHtml += `<div class="stats-item">🏆 Очки: ${data.points}</div>`;
-            if (data.sets_won && data.sets_lost) statsHtml += `<div class="stats-item">🏐 Партии: ${data.sets_won}:${data.sets_lost}</div>`;
-            if (data.wins && data.losses) statsHtml += `<div class="stats-item">📊 Победы/Поражения: ${data.wins}/${data.losses}</div>`;
-            statsHtml += `<div class="stats-item">💪 Сила: ${data.strength}%</div>`;
-            
+            if (data.balls_won && data.balls_lost) {
+                statsHtml += `<div class="stats-item">🎯 Очки: ${data.balls_won}:${data.balls_lost}</div>`;
+            }
+            if (data.sets_won && data.sets_lost) {
+                statsHtml += `<div class="stats-item">🏆 Сеты: ${data.sets_won}:${data.sets_lost}</div>`;
+            }
             statsDiv.innerHTML = statsHtml;
             statsDiv.classList.add('show');
         }
 
-        function getStrength(team) {
-            return teamsData[team]?.strength || 50;
+        function getTeamData(teamName) {
+            return teamsData[teamName] || null;
+        }
+
+        function calculatePR(homeBallsWon, homeBallsLost, awayBallsWon, awayBallsLost, isNeutral) {
+            if (!homeBallsWon || !homeBallsLost || !awayBallsWon || !awayBallsLost) return null;
+            if (homeBallsLost === 0 || awayBallsLost === 0) return null;
+            
+            let homeRatio = homeBallsWon / homeBallsLost;
+            let awayRatio = awayBallsWon / awayBallsLost;
+            
+            let homeProb = homeRatio / (homeRatio + awayRatio);
+            
+            if (!isNeutral) homeProb *= 1.05;
+            homeProb = Math.min(0.95, Math.max(0.05, homeProb));
+            
+            const margin = 0.075;
+            const odds = (1 / homeProb) * (1 - margin);
+            const awayProb = 1 - homeProb;
+            const awayOdds = (1 / awayProb) * (1 - margin);
+            
+            return { homeOdds: round(odds, 2), homeProb: round(homeProb * 100, 1), awayOdds: round(awayOdds, 2), awayProb: round(awayProb * 100, 1) };
+        }
+
+        function calculateBT(homeSetsWon, homeSetsLost, awaySetsWon, awaySetsLost, isNeutral) {
+            if (!homeSetsWon || !homeSetsLost || !awaySetsWon || !awaySetsLost) return null;
+            if (homeSetsLost === 0 || awaySetsLost === 0) return null;
+            
+            let homeRatio = homeSetsWon / homeSetsLost;
+            let awayRatio = awaySetsWon / awaySetsLost;
+            
+            let homeProb = homeRatio / (homeRatio + awayRatio);
+            
+            if (!isNeutral) homeProb *= 1.03;
+            homeProb = Math.min(0.95, Math.max(0.05, homeProb));
+            
+            const margin = 0.075;
+            const odds = (1 / homeProb) * (1 - margin);
+            const awayProb = 1 - homeProb;
+            const awayOdds = (1 / awayProb) * (1 - margin);
+            
+            return { homeOdds: round(odds, 2), homeProb: round(homeProb * 100, 1), awayOdds: round(awayOdds, 2), awayProb: round(awayProb * 100, 1) };
+        }
+
+        function round(num, decimals) {
+            return Math.round(num * Math.pow(10, decimals)) / Math.pow(10, decimals);
         }
 
         function calculateOdds() {
-            const homeTeam = document.getElementById('homeTeam').value;
-            const awayTeam = document.getElementById('awayTeam').value;
-            const neutral = document.getElementById('neutralVenue').checked;
-
-            if (homeTeam === awayTeam) {
+            const isNeutral = document.getElementById('neutralVenue').checked;
+            const useManual = document.getElementById('useManual').checked;
+            
+            let homeName, awayName;
+            let homeBallsWon, homeBallsLost, homeSetsWon, homeSetsLost;
+            let awayBallsWon, awayBallsLost, awaySetsWon, awaySetsLost;
+            
+            if (useManual) {
+                homeName = document.getElementById('homeName').value || 'Хозяева';
+                awayName = document.getElementById('awayName').value || 'Гости';
+                homeSetsWon = parseInt(document.getElementById('homeSetsWon').value) || null;
+                homeSetsLost = parseInt(document.getElementById('homeSetsLost').value) || null;
+                homeBallsWon = parseInt(document.getElementById('homeBallsWon').value) || null;
+                homeBallsLost = parseInt(document.getElementById('homeBallsLost').value) || null;
+                awaySetsWon = parseInt(document.getElementById('awaySetsWon').value) || null;
+                awaySetsLost = parseInt(document.getElementById('awaySetsLost').value) || null;
+                awayBallsWon = parseInt(document.getElementById('awayBallsWon').value) || null;
+                awayBallsLost = parseInt(document.getElementById('awayBallsLost').value) || null;
+            } else {
+                const homeTeam = document.getElementById('homeTeam')?.value;
+                const awayTeam = document.getElementById('awayTeam')?.value;
+                if (!homeTeam || !awayTeam) {
+                    showStatus('Выберите команды или включите ручной ввод', 'error');
+                    return;
+                }
+                homeName = homeTeam;
+                awayName = awayTeam;
+                const homeData = getTeamData(homeTeam);
+                const awayData = getTeamData(awayTeam);
+                if (homeData) {
+                    homeSetsWon = homeData.sets_won;
+                    homeSetsLost = homeData.sets_lost;
+                    homeBallsWon = homeData.balls_won;
+                    homeBallsLost = homeData.balls_lost;
+                }
+                if (awayData) {
+                    awaySetsWon = awayData.sets_won;
+                    awaySetsLost = awayData.sets_lost;
+                    awayBallsWon = awayData.balls_won;
+                    awayBallsLost = awayData.balls_lost;
+                }
+            }
+            
+            if (homeName === awayName) {
                 showStatus('Выберите разные команды', 'error');
                 return;
             }
-
-            let homeStrength = getStrength(homeTeam);
-            let awayStrength = getStrength(awayTeam);
-
-            // Бонус домашнего поля +5%
-            if (!neutral) {
-                homeStrength = Math.min(99, homeStrength + 5);
+            
+            // Расчёт PR (по очкам)
+            let prResult = null;
+            let prAvailable = homeBallsWon && homeBallsLost && awayBallsWon && awayBallsLost;
+            if (prAvailable) {
+                prResult = calculatePR(homeBallsWon, homeBallsLost, awayBallsWon, awayBallsLost, isNeutral);
             }
-
-            // Расчёт вероятностей
-            let homeProb = 1 / (1 + Math.exp((awayStrength - homeStrength) / 15));
             
-            // Корректировка
-            homeProb = Math.min(0.95, Math.max(0.05, homeProb));
-            
-            // Вероятность тотала (3+ сетов)
-            const drawProb = Math.abs(homeStrength - awayStrength) < 20 ? 0.22 : 0.12;
-            
-            let awayProb = 1 - homeProb - drawProb;
-            if (awayProb < 0.05) {
-                awayProb = 0.05;
-                homeProb = 1 - drawProb - awayProb;
+            // Расчёт BT (по сетам)
+            let btResult = null;
+            let btAvailable = homeSetsWon && homeSetsLost && awaySetsWon && awaySetsLost;
+            if (btAvailable) {
+                btResult = calculateBT(homeSetsWon, homeSetsLost, awaySetsWon, awaySetsLost, isNeutral);
             }
-
-            // Маржа 7.5%
-            const margin = 0.075;
-            const homeOdds = (1 / homeProb) * (1 - margin);
-            const drawOdds = (1 / drawProb) * (1 - margin);
-            const awayOdds = (1 / awayProb) * (1 - margin);
-
-            document.getElementById('homeOdds').textContent = homeOdds.toFixed(2);
-            document.getElementById('drawOdds').textContent = drawOdds.toFixed(2);
-            document.getElementById('awayOdds').textContent = awayOdds.toFixed(2);
-            document.getElementById('homeProb').textContent = `${(homeProb*100).toFixed(1)}%`;
-            document.getElementById('drawProb').textContent = `${(drawProb*100).toFixed(1)}%`;
-            document.getElementById('awayProb').textContent = `${(awayProb*100).toFixed(1)}%`;
             
-            let rec = homeOdds > 1.8 && homeProb > 0.5 ? '🎯 Ценность в ставке на хозяев' : 
-                      awayOdds > 2.0 && awayProb > 0.35 ? '🎯 Ценность в ставке на гостей' : 
-                      '📊 Фаворит очевиден';
-            document.getElementById('recommendation').textContent = rec;
-
+            // Финальный результат (среднее)
+            let finalOdds = null;
+            let finalProb = null;
+            let totalUnder = false;
+            
+            if (prResult && btResult) {
+                finalOdds = round((prResult.homeOdds + btResult.homeOdds) / 2, 2);
+                finalProb = round((prResult.homeProb + btResult.homeProb) / 2, 1);
+                // Проверка на тотал
+                if (Math.abs(prResult.homeProb - prResult.awayProb) > 40 || Math.abs(btResult.homeProb - btResult.awayProb) > 35) {
+                    totalUnder = true;
+                }
+            } else if (prResult) {
+                finalOdds = prResult.homeOdds;
+                finalProb = prResult.homeProb;
+            } else if (btResult) {
+                finalOdds = btResult.homeOdds;
+                finalProb = btResult.homeProb;
+            }
+            
+            // Отображение
+            document.getElementById('prOdds').textContent = prResult ? `${prResult.homeOdds} / ${prResult.awayOdds}` : '—';
+            document.getElementById('prProb').textContent = prResult ? `${homeName}: ${prResult.homeProb}% | ${awayName}: ${prResult.awayProb}%` : 'Нет данных по очкам';
+            document.getElementById('btOdds').textContent = btResult ? `${btResult.homeOdds} / ${btResult.awayOdds}` : '—';
+            document.getElementById('btProb').textContent = btResult ? `${homeName}: ${btResult.homeProb}% | ${awayName}: ${btResult.awayProb}%` : 'Нет данных по сетам';
+            document.getElementById('finalOdds').textContent = finalOdds ? `${finalOdds} / ${finalOdds ? round(1/finalOdds*100/0.925, 2) : '-'}` : '—';
+            document.getElementById('finalProb').textContent = finalProb ? `${homeName}: ${finalProb}% | ${awayName}: ${round(100-finalProb, 1)}%` : '—';
+            
+            let totalHtml = '';
+            if (totalUnder) {
+                totalHtml = '<div style="background: rgba(255,215,0,0.3); padding: 10px; border-radius: 8px;">📉 Выносной матч! Рекомендуется рассмотреть тотал меньше (Under). Например, Total Points Under 39.5</div>';
+            } else if (prResult && btResult && Math.abs(prResult.homeProb - btResult.homeProb) < 15) {
+                totalHtml = '<div style="background: rgba(255,215,0,0.2); padding: 10px; border-radius: 8px;">⚖️ PR и BT совпадают. Матч ожидается конкурентным.</div>';
+            } else if (prResult && btResult) {
+                totalHtml = '<div style="background: rgba(255,165,0,0.2); padding: 10px; border-radius: 8px;">⚠️ Расхождение между PR и BT. Рекомендуется осторожность.</div>';
+            }
+            document.getElementById('totalInfo').innerHTML = totalHtml;
+            
+            let recommendation = '';
+            if (finalOdds && finalOdds > 1.8 && finalProb > 55) {
+                recommendation = `🎯 Ценность в ставке на ${homeName} (коэффициент ${finalOdds})`;
+            } else if (finalOdds && finalOdds < 1.3 && finalProb > 75) {
+                recommendation = `📊 Фаворит очевиден - ${homeName}`;
+            } else if (totalUnder) {
+                recommendation = '📉 Рекомендуется рассмотреть тотал меньше (Under)';
+            } else {
+                recommendation = '📊 Равный матч, смотрите live';
+            }
+            document.getElementById('recommendation').textContent = recommendation;
+            
             document.getElementById('result').style.display = 'block';
             document.getElementById('result').scrollIntoView({ behavior: 'smooth' });
         }
@@ -627,6 +765,9 @@ HTML_TEMPLATE = '''
         }
 
         document.getElementById('parseBtn').onclick = parseTable;
+        document.getElementById('manualStatsBtn').onclick = () => {
+            document.getElementById('manualStats').classList.toggle('active');
+        };
     </script>
 </body>
 </html>
