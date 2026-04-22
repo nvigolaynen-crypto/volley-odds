@@ -2,99 +2,56 @@ from flask import Flask, request, jsonify, render_template_string
 import requests
 from bs4 import BeautifulSoup
 import re
-import math
+from collections import defaultdict
 
 app = Flask(__name__)
 
 def clean_team_name(text):
     """Очищает название команды от мусора"""
+    # Убираем "-й", "-я", "-е"
     text = re.sub(r'^\d+[-]?[йяе]?\s*', '', text)
     text = re.sub(r'\s*\d+[-]?[йяе]?\s*$', '', text)
+    # Убираем времена
     text = re.sub(r'\d{1,2}[:\.]\d{2}\s*(?:MCK|МСК|MSK)?', '', text)
+    # Убираем даты
     text = re.sub(r'\d{1,2}\.\d{1,2}\.\d{4}', '', text)
+    text = re.sub(r'\d{4}-\d{2}-\d{2}', '', text)
+    # Убираем одиночные числа
     text = re.sub(r'\b\d+\b', '', text)
-    garbage = ['МСК', 'MCK', 'MSK', 'дата', 'time', 'date', 'время', '№', 'круг', 'тур', 'Время', 'местное', 'место']
+    # Убираем слова-маркеры
+    garbage = ['МСК', 'MCK', 'MSK', 'дата', 'time', 'date', 'время', '№', 'круг', 'тур', 'Время', 'местное', 'место', 'команда', 'игрок']
     for g in garbage:
         text = text.replace(g, '')
+    # Убираем лишние пробелы
     text = re.sub(r'[^\w\s\u0400-\u04FF]', '', text)
     text = re.sub(r'\s+', ' ', text)
     return text.strip()
 
-def calculate_pr_odds(balls_won, balls_lost, home_bonus=1.05):
-    """Расчёт коэффициента на основе очков (PR)"""
-    if balls_won is None or balls_lost is None or balls_lost == 0:
-        return None
-    
-    # Соотношение выигранных/проигранных очков
-    ratio = balls_won / balls_lost
-    
-    # Вероятность победы на основе очков
-    prob = ratio / (1 + ratio)
-    
-    # Применяем бонус домашней площадки
-    prob = prob * home_bonus
-    prob = min(0.95, max(0.05, prob))
-    
-    # Коэффициент с маржой 7.5%
-    margin = 0.075
-    odds = (1 / prob) * (1 - margin)
-    
-    return round(odds, 2), round(prob * 100, 1)
-
-def calculate_bt_odds(sets_won, sets_lost, home_bonus=1.03):
-    """Расчёт коэффициента на основе сетов (BT)"""
-    if sets_won is None or sets_lost is None or sets_lost == 0:
-        return None
-    
-    # Соотношение выигранных/проигранных сетов
-    ratio = sets_won / sets_lost
-    
-    # Вероятность победы на основе сетов (более консервативно)
-    prob = ratio / (1 + ratio)
-    
-    # Применяем бонус домашней площадки (меньше, чем для очков)
-    prob = prob * home_bonus
-    prob = min(0.95, max(0.05, prob))
-    
-    # Коэффициент с маржой 7.5%
-    margin = 0.075
-    odds = (1 / prob) * (1 - margin)
-    
-    return round(odds, 2), round(prob * 100, 1)
-
-def check_total_under(home_strength_pr, away_strength_pr, home_strength_bt, away_strength_bt):
-    """Проверка на тотал (выносной матч)"""
-    # Если разница в силе большая - тотал меньше
-    diff_pr = abs(home_strength_pr - away_strength_pr) if home_strength_pr and away_strength_pr else 0
-    diff_bt = abs(home_strength_bt - away_strength_bt) if home_strength_bt and away_strength_bt else 0
-    
-    if diff_pr > 40 or diff_bt > 35:
-        return True
-    return False
-
 def parse_tournament_table(url):
-    """Парсит турнирную таблицу для PR и BT"""
+    """Парсит турнирную таблицу и все матчи для подсчёта статистики"""
     try:
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
         response = requests.get(url, headers=headers, timeout=15)
         response.raise_for_status()
         
         soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # Находим все таблицы
         tables = soup.find_all('table')
         
         if not tables:
             return None, "Таблица не найдена", []
         
-        teams_data = {}
+        # Хранилище для команд и их статистики
+        teams_stats = {}
+        team_names_set = set()
         
+        # Сначала находим все названия команд из таблицы
         for table in tables:
             rows = table.find_all('tr')
-            
             for row in rows:
                 cols = row.find_all('td')
-                if len(cols) >= 4:
-                    # Поиск названия команды
-                    team_name = None
+                if len(cols) >= 2:
                     for idx, col in enumerate(cols[:3]):
                         text = col.get_text(strip=True)
                         if len(text) < 2:
@@ -103,54 +60,124 @@ def parse_tournament_table(url):
                             continue
                         if re.match(r'^\d{1,2}[:\.]\d{2}$', text):
                             continue
+                        if re.search(r'МСК|MCK', text):
+                            continue
+                        
                         clean = clean_team_name(text)
                         if len(clean) > 2 and not clean.isdigit():
                             if clean.lower() not in ['дата', 'время', 'место', 'команда']:
-                                team_name = clean
-                                break
-                    
-                    if not team_name:
-                        continue
-                    
-                    if team_name in teams_data:
-                        continue
-                    
-                    # Собираем всю строку
+                                team_names_set.add(clean)
+        
+        # Инициализируем статистику для каждой команды
+        for name in team_names_set:
+            teams_stats[name] = {
+                'name': name,
+                'balls_won': 0,
+                'balls_lost': 0,
+                'sets_won': 0,
+                'sets_lost': 0,
+                'matches': 0
+            }
+        
+        # Парсим все строки для сбора статистики из матчей
+        for table in tables:
+            rows = table.find_all('tr')
+            for row in rows:
+                cols = row.find_all('td')
+                if len(cols) >= 4:
                     row_text = ' '.join([c.get_text(strip=True) for c in cols])
                     
-                    # Поиск мячей (очков) - формат 89:31 или 89-31
-                    balls_won = None
-                    balls_lost = None
-                    sets_won = None
-                    sets_lost = None
+                    # Ищем команды в строке
+                    teams_in_row = []
+                    for team in team_names_set:
+                        if team.lower() in row_text.lower():
+                            teams_in_row.append(team)
                     
-                    # Ищем все пары чисел
-                    matches = re.findall(r'(\d+)[:-](\d+)', row_text)
-                    
-                    for w, l in matches:
-                        w_int = int(w)
-                        l_int = int(l)
-                        # Мячи обычно в диапазоне 20-150
-                        if 20 <= w_int <= 200 and 20 <= l_int <= 200:
-                            balls_won = w_int
-                            balls_lost = l_int
-                        # Сеты обычно 0-5
-                        elif w_int <= 5 and l_int <= 5:
-                            sets_won = w_int
-                            sets_lost = l_int
-                    
-                    teams_data[team_name] = {
-                        'name': team_name,
-                        'balls_won': balls_won,
-                        'balls_lost': balls_lost,
-                        'sets_won': sets_won,
-                        'sets_lost': sets_lost
-                    }
+                    # Если нашли 2 команды - это матч
+                    if len(teams_in_row) == 2:
+                        team1, team2 = teams_in_row[0], teams_in_row[1]
+                        
+                        # Ищем счета в строке
+                        # Формат партий: 3:1, 3-1, 3:2 и т.д.
+                        set_matches = re.findall(r'(\d)[:-](\d)', row_text)
+                        # Формат очков: 25:23, 25-20 и т.д.
+                        ball_matches = re.findall(r'(\d{1,3})[:-](\d{1,3})', row_text)
+                        
+                        # Собираем партии
+                        sets1 = 0
+                        sets2 = 0
+                        for s1, s2 in set_matches:
+                            if int(s1) > int(s2):
+                                sets1 += 1
+                            else:
+                                sets2 += 1
+                        
+                        if sets1 > 0 or sets2 > 0:
+                            teams_stats[team1]['sets_won'] += sets1
+                            teams_stats[team1]['sets_lost'] += sets2
+                            teams_stats[team2]['sets_won'] += sets2
+                            teams_stats[team2]['sets_lost'] += sets1
+                            teams_stats[team1]['matches'] += 1
+                            teams_stats[team2]['matches'] += 1
+                        
+                        # Собираем очки (мячи)
+                        balls1 = 0
+                        balls2 = 0
+                        for b1, b2 in ball_matches:
+                            if int(b1) > 0 and int(b2) > 0:
+                                balls1 += int(b1)
+                                balls2 += int(b2)
+                        
+                        if balls1 > 0 or balls2 > 0:
+                            teams_stats[team1]['balls_won'] += balls1
+                            teams_stats[team1]['balls_lost'] += balls2
+                            teams_stats[team2]['balls_won'] += balls2
+                            teams_stats[team2]['balls_lost'] += balls1
         
-        if not teams_data:
+        # Формируем результат
+        result_teams = {}
+        team_names = []
+        
+        for name, stats in teams_stats.items():
+            # Если нет данных из матчей, пробуем найти в таблице
+            if stats['balls_won'] == 0 and stats['sets_won'] == 0:
+                # Ищем итоговые данные в таблице
+                for table in tables:
+                    rows = table.find_all('tr')
+                    for row in rows:
+                        cols = row.find_all('td')
+                        if len(cols) >= 6:
+                            row_text = ' '.join([c.get_text(strip=True) for c in cols])
+                            if name.lower() in row_text.lower():
+                                # Ищем партии
+                                set_match = re.search(r'(\d+)[:-](\d+)', row_text)
+                                if set_match:
+                                    stats['sets_won'] = int(set_match.group(1))
+                                    stats['sets_lost'] = int(set_match.group(2))
+                                # Ищем очки
+                                ball_match = re.findall(r'(\d{2,3})', row_text)
+                                if len(ball_match) >= 2:
+                                    stats['balls_won'] = int(ball_match[0])
+                                    stats['balls_lost'] = int(ball_match[1])
+            
+            # Пропускаем команды без данных
+            if stats['sets_won'] == 0 and stats['balls_won'] == 0:
+                continue
+            
+            result_teams[name] = {
+                'name': name,
+                'balls_won': stats['balls_won'] if stats['balls_won'] > 0 else None,
+                'balls_lost': stats['balls_lost'] if stats['balls_lost'] > 0 else None,
+                'sets_won': stats['sets_won'] if stats['sets_won'] > 0 else None,
+                'sets_lost': stats['sets_lost'] if stats['sets_lost'] > 0 else None,
+                'matches': stats['matches']
+            }
+            team_names.append(name)
+        
+        if not result_teams:
             return None, "Не удалось распознать команды", []
         
-        return teams_data, None, list(teams_data.keys())
+        return result_teams, None, team_names
         
     except Exception as e:
         return None, str(e), []
@@ -309,10 +336,6 @@ HTML_TEMPLATE = '''
             font-size: 2em;
             font-weight: bold;
         }
-        .result-card .small {
-            font-size: 0.9em;
-            margin-top: 5px;
-        }
         .final-result {
             background: rgba(255,215,0,0.2);
             border: 2px solid gold;
@@ -370,7 +393,6 @@ HTML_TEMPLATE = '''
         }
         .status.success { background: #d4edda; color: #155724; }
         .status.error { background: #f8d7da; color: #721c24; }
-        .status.info { background: #d1ecf1; color: #0c5460; }
         .empty-state {
             text-align: center;
             padding: 40px;
@@ -528,13 +550,14 @@ HTML_TEMPLATE = '''
                 return;
             }
             
-            let html = '<div style="font-weight: bold; margin-bottom: 15px;">📊 Данные из таблицы:</div>';
+            let html = '<div style="font-weight: bold; margin-bottom: 15px;">📊 Команды из таблицы:</div>';
             for (const [name, data] of Object.entries(teams)) {
                 html += `<div class="team-row">
                     <span style="min-width: 200px;">🏐 ${name}</span>
                     <span style="font-size: 0.8em; color: #666;">`;
                 if (data.balls_won) html += `🎯 Очки: ${data.balls_won}:${data.balls_lost} `;
                 if (data.sets_won) html += `🏆 Сеты: ${data.sets_won}:${data.sets_lost}`;
+                if (data.matches) html += ` 📊 Матчей: ${data.matches}`;
                 html += `</span></div>`;
             }
             container.innerHTML = html;
@@ -589,6 +612,9 @@ HTML_TEMPLATE = '''
             if (data.sets_won && data.sets_lost) {
                 statsHtml += `<div class="stats-item">🏆 Сеты: ${data.sets_won}:${data.sets_lost}</div>`;
             }
+            if (data.matches) {
+                statsHtml += `<div class="stats-item">📊 Сыграно матчей: ${data.matches}</div>`;
+            }
             statsDiv.innerHTML = statsHtml;
             statsDiv.classList.add('show');
         }
@@ -614,7 +640,7 @@ HTML_TEMPLATE = '''
             const awayProb = 1 - homeProb;
             const awayOdds = (1 / awayProb) * (1 - margin);
             
-            return { homeOdds: round(odds, 2), homeProb: round(homeProb * 100, 1), awayOdds: round(awayOdds, 2), awayProb: round(awayProb * 100, 1) };
+            return { homeOdds: Math.round(odds * 100) / 100, homeProb: Math.round(homeProb * 1000) / 10, awayOdds: Math.round(awayOdds * 100) / 100, awayProb: Math.round(awayProb * 1000) / 10 };
         }
 
         function calculateBT(homeSetsWon, homeSetsLost, awaySetsWon, awaySetsLost, isNeutral) {
@@ -634,11 +660,7 @@ HTML_TEMPLATE = '''
             const awayProb = 1 - homeProb;
             const awayOdds = (1 / awayProb) * (1 - margin);
             
-            return { homeOdds: round(odds, 2), homeProb: round(homeProb * 100, 1), awayOdds: round(awayOdds, 2), awayProb: round(awayProb * 100, 1) };
-        }
-
-        function round(num, decimals) {
-            return Math.round(num * Math.pow(10, decimals)) / Math.pow(10, decimals);
+            return { homeOdds: Math.round(odds * 100) / 100, homeProb: Math.round(homeProb * 1000) / 10, awayOdds: Math.round(awayOdds * 100) / 100, awayProb: Math.round(awayProb * 1000) / 10 };
         }
 
         function calculateOdds() {
@@ -710,9 +732,8 @@ HTML_TEMPLATE = '''
             let totalUnder = false;
             
             if (prResult && btResult) {
-                finalOdds = round((prResult.homeOdds + btResult.homeOdds) / 2, 2);
-                finalProb = round((prResult.homeProb + btResult.homeProb) / 2, 1);
-                // Проверка на тотал
+                finalOdds = Math.round(((prResult.homeOdds + btResult.homeOdds) / 2) * 100) / 100;
+                finalProb = Math.round(((prResult.homeProb + btResult.homeProb) / 2) * 10) / 10;
                 if (Math.abs(prResult.homeProb - prResult.awayProb) > 40 || Math.abs(btResult.homeProb - btResult.awayProb) > 35) {
                     totalUnder = true;
                 }
@@ -729,8 +750,8 @@ HTML_TEMPLATE = '''
             document.getElementById('prProb').textContent = prResult ? `${homeName}: ${prResult.homeProb}% | ${awayName}: ${prResult.awayProb}%` : 'Нет данных по очкам';
             document.getElementById('btOdds').textContent = btResult ? `${btResult.homeOdds} / ${btResult.awayOdds}` : '—';
             document.getElementById('btProb').textContent = btResult ? `${homeName}: ${btResult.homeProb}% | ${awayName}: ${btResult.awayProb}%` : 'Нет данных по сетам';
-            document.getElementById('finalOdds').textContent = finalOdds ? `${finalOdds} / ${finalOdds ? round(1/finalOdds*100/0.925, 2) : '-'}` : '—';
-            document.getElementById('finalProb').textContent = finalProb ? `${homeName}: ${finalProb}% | ${awayName}: ${round(100-finalProb, 1)}%` : '—';
+            document.getElementById('finalOdds').textContent = finalOdds ? `${finalOdds} / ${finalOdds ? Math.round((1/finalOdds*100/0.925) * 100) / 100 : '-'}` : '—';
+            document.getElementById('finalProb').textContent = finalProb ? `${homeName}: ${finalProb}% | ${awayName}: ${Math.round((100-finalProb) * 10) / 10}%` : '—';
             
             let totalHtml = '';
             if (totalUnder) {
@@ -746,54 +767,4 @@ HTML_TEMPLATE = '''
             if (finalOdds && finalOdds > 1.8 && finalProb > 55) {
                 recommendation = `🎯 Ценность в ставке на ${homeName} (коэффициент ${finalOdds})`;
             } else if (finalOdds && finalOdds < 1.3 && finalProb > 75) {
-                recommendation = `📊 Фаворит очевиден - ${homeName}`;
-            } else if (totalUnder) {
-                recommendation = '📉 Рекомендуется рассмотреть тотал меньше (Under)';
-            } else {
-                recommendation = '📊 Равный матч, смотрите live';
-            }
-            document.getElementById('recommendation').textContent = recommendation;
-            
-            document.getElementById('result').style.display = 'block';
-            document.getElementById('result').scrollIntoView({ behavior: 'smooth' });
-        }
-
-        function showStatus(msg, type) {
-            const div = document.getElementById('status');
-            div.innerHTML = `<div class="status ${type}">${msg}</div>`;
-            setTimeout(() => div.innerHTML = '', 5000);
-        }
-
-        document.getElementById('parseBtn').onclick = parseTable;
-        document.getElementById('manualStatsBtn').onclick = () => {
-            document.getElementById('manualStats').classList.toggle('active');
-        };
-    </script>
-</body>
-</html>
-'''
-
-@app.route('/')
-def home():
-    return render_template_string(HTML_TEMPLATE)
-
-@app.route('/parse-table', methods=['POST'])
-def parse_table():
-    data = request.json
-    url = data.get('url')
-    if not url:
-        return jsonify({'success': False, 'error': 'URL не указан'})
-    
-    teams_data, error, team_names = parse_tournament_table(url)
-    
-    if error:
-        return jsonify({'success': False, 'error': error})
-    
-    return jsonify({
-        'success': True, 
-        'teams': teams_data,
-        'team_names': team_names
-    })
-
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=10000)
+               
