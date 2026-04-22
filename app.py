@@ -5,93 +5,93 @@ import re
 
 app = Flask(__name__)
 
-# База данных команд
-TEAMS_DATABASE = {
-    'Zenit': {'attack': 92, 'defense': 88, 'homeBonus': 1.15, 'name': 'Зенит-Казань', 'strength': 90},
-    'Dinamo': {'attack': 85, 'defense': 82, 'homeBonus': 1.10, 'name': 'Динамо Москва', 'strength': 83},
-    'Lokomotiv': {'attack': 88, 'defense': 85, 'homeBonus': 1.12, 'name': 'Локомотив Новосибирск', 'strength': 86},
-    'Fakel': {'attack': 78, 'defense': 80, 'homeBonus': 1.08, 'name': 'Факел Ямал', 'strength': 79},
-    'Kuzbass': {'attack': 82, 'defense': 79, 'homeBonus': 1.09, 'name': 'Кузбасс Кемерово', 'strength': 80},
-    'Belogorie': {'attack': 86, 'defense': 83, 'homeBonus': 1.11, 'name': 'Белогорье Белгород', 'strength': 84}
-}
-
-# Глобальная переменная для хранения распарсенных данных
-parsed_teams_data = {}
+# Пустая база команд - будет заполняться из таблицы
+TEAMS_DATABASE = {}
 
 def parse_tournament_table(url):
-    """Парсит турнирную таблицу и возвращает силу команд"""
-    global parsed_teams_data
-    
+    """Парсит турнирную таблицу и извлекает все команды с их показателями"""
     try:
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
         response = requests.get(url, headers=headers, timeout=15)
         response.raise_for_status()
         
         soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # Ищем все таблицы на странице
         tables = soup.find_all('table')
         
         if not tables:
-            return None, "Таблица не найдена"
+            return None, "Таблица не найдена на странице", []
         
-        # Ищем данные во всех таблицах
         teams_data = {}
+        all_teams = []
         
+        # Парсим каждую таблицу
         for table in tables:
             rows = table.find_all('tr')
+            
             for row in rows:
                 cols = row.find_all('td')
                 if len(cols) >= 2:
-                    row_text = ' '.join([c.get_text(strip=True).lower() for c in cols])
+                    # Собираем текст всей строки
+                    row_text = ' '.join([c.get_text(strip=True) for c in cols])
                     
-                    # Проверяем каждую команду
-                    for key, team in TEAMS_DATABASE.items():
-                        team_name_lower = team['name'].lower()
-                        if team_name_lower in row_text:
-                            # Ищем числовые показатели в строке
-                            numbers = re.findall(r'(\d+(?:\.\d+)?)', row_text)
-                            if numbers:
-                                for num in numbers:
-                                    val = float(num)
-                                    # Нормализуем значение (если слишком большое - делим)
-                                    if val > 100:
-                                        val = val / 10 if val < 1000 else min(100, val / 20)
-                                    if 0 < val <= 100:
-                                        teams_data[key] = val
-                                        break
+                    # Ищем название команды (обычно в первых колонках)
+                    team_name = None
+                    for col in cols[:3]:  # Проверяем первые 3 колонки
+                        text = col.get_text(strip=True)
+                        # Фильтруем мусор (числа, короткие слова)
+                        if len(text) > 2 and not text.isdigit() and not text.replace('.', '').isdigit():
+                            if not any(x in text.lower() for x in ['команда', 'team', 'клуб', 'club', 'место', 'place', 'position']):
+                                team_name = text
+                                break
+                    
+                    if team_name:
+                        # Ищем числовые показатели (очки, проценты)
+                        numbers = re.findall(r'(\d+(?:\.\d+)?)', row_text)
+                        strength = 50  # Значение по умолчанию
+                        
+                        for num in numbers:
+                            val = float(num)
+                            # Определяем наиболее вероятный показатель силы
+                            if 0 < val <= 100:
+                                strength = val
+                                break
+                            elif 100 < val <= 200:
+                                strength = val / 2
+                                break
+                            elif val > 200:
+                                strength = min(100, val / 10)
+                                break
+                        
+                        # Нормализуем название команды (убираем лишние символы)
+                        team_name = re.sub(r'[^\w\s\u0400-\u04FF-]', '', team_name).strip()
+                        
+                        if team_name and len(team_name) > 2:
+                            teams_data[team_name] = {
+                                'strength': round(strength, 1),
+                                'attack': round(strength, 1),
+                                'defense': round(max(30, strength - 10), 1),
+                                'homeBonus': 1.10,
+                                'name': team_name
+                            }
+                            all_teams.append(team_name)
         
-        # Если ничего не нашли - используем демо-данные для теста
         if not teams_data:
-            teams_data = {
-                'Zenit': 92,
-                'Dinamo': 85,
-                'Lokomotiv': 88,
-                'Fakel': 78,
-                'Kuzbass': 82,
-                'Belogorie': 86
-            }
+            return None, "Не удалось распознать команды в таблице", []
         
-        # Обновляем глобальные данные
-        parsed_teams_data = teams_data
-        
-        # Обновляем базу данных
-        for key, strength in teams_data.items():
-            if key in TEAMS_DATABASE:
-                TEAMS_DATABASE[key]['strength'] = strength
-                TEAMS_DATABASE[key]['attack'] = strength
-                TEAMS_DATABASE[key]['defense'] = strength - 5
-        
-        return teams_data, None
+        return teams_data, None, all_teams
         
     except Exception as e:
-        return None, str(e)
+        return None, str(e), []
 
-# HTML с улучшенным JavaScript
+# HTML с динамическими командами
 HTML_TEMPLATE = '''
 <!DOCTYPE html>
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
-    <title>Volley Odds - Парсинг таблиц</title>
+    <title>Volley Odds - Динамический парсер</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -165,9 +165,10 @@ HTML_TEMPLATE = '''
             display: flex;
             justify-content: space-between;
             align-items: center;
-            padding: 8px;
+            padding: 10px;
             border-bottom: 1px solid #e0e0e0;
         }
+        .team-strength:last-child { border-bottom: none; }
         .strength-bar {
             flex: 1;
             margin: 0 15px;
@@ -271,9 +272,10 @@ HTML_TEMPLATE = '''
         .status.success { background: #d4edda; color: #155724; }
         .status.error { background: #f8d7da; color: #721c24; }
         .status.info { background: #d1ecf1; color: #0c5460; }
-        .strength-updated {
-            background: #e8f5e9;
-            border-left: 4px solid #4caf50;
+        .empty-state {
+            text-align: center;
+            padding: 40px;
+            color: #999;
         }
         @media (max-width: 768px) {
             .team-selector, .odds-grid { grid-template-columns: 1fr; }
@@ -285,14 +287,14 @@ HTML_TEMPLATE = '''
     <div class="container">
         <div class="header">
             <h1>🏐 Volley Odds by Shtopor</h1>
-            <div>Профессиональный расчёт + парсинг таблиц</div>
+            <div>Динамический парсер турнирных таблиц</div>
         </div>
         <div class="content">
             <div class="section">
                 <div class="section-title">🔗 Ссылка на турнирную таблицу</div>
                 <div class="url-input-group">
-                    <input type="url" id="tableUrl" placeholder="https://volley.ru/calendar/...">
-                    <button id="parseBtn">📊 Загрузить и распознать таблицу</button>
+                    <input type="url" id="tableUrl" placeholder="https://example.com/volleyball-standings">
+                    <button id="parseBtn">📊 Загрузить команды из таблицы</button>
                 </div>
                 <div id="parsedData" class="parsed-data"></div>
                 <div id="status"></div>
@@ -300,38 +302,20 @@ HTML_TEMPLATE = '''
 
             <div class="section" id="teamsSection">
                 <div class="section-title">🏟️ Выберите команды</div>
-                <div class="team-selector">
-                    <div class="team-card">
-                        <label>🏠 Домашняя команда</label>
-                        <select id="homeTeam">
-                            <option value="Zenit">Зенит-Казань</option>
-                            <option value="Dinamo">Динамо Москва</option>
-                            <option value="Lokomotiv">Локомотив Новосибирск</option>
-                            <option value="Fakel">Факел Ямал</option>
-                            <option value="Kuzbass">Кузбасс Кемерово</option>
-                            <option value="Belogorie">Белогорье Белгород</option>
-                        </select>
-                    </div>
-                    <div class="team-card">
-                        <label>✈️ Гостевая команда</label>
-                        <select id="awayTeam">
-                            <option value="Belogorie">Белогорье Белгород</option>
-                            <option value="Dinamo">Динамо Москва</option>
-                            <option value="Zenit">Зенит-Казань</option>
-                            <option value="Lokomotiv">Локомотив Новосибирск</option>
-                            <option value="Fakel">Факел Ямал</option>
-                            <option value="Kuzbass">Кузбасс Кемерово</option>
-                        </select>
+                <div id="teamSelectorsContainer">
+                    <div class="empty-state">
+                        ⚡ Сначала загрузите турнирную таблицу по ссылке<br>
+                        Команды появятся здесь автоматически
                     </div>
                 </div>
-                <div class="options">
+                <div class="options" id="optionsPanel" style="display: none;">
                     <label class="checkbox-label">
                         <input type="checkbox" id="neutralVenue"> 🏟️ Нейтральная площадка
                     </label>
                 </div>
             </div>
 
-            <button onclick="calculateOdds()">🎯 Рассчитать котировки</button>
+            <button id="calculateBtn" style="display: none;" onclick="calculateOdds()">🎯 Рассчитать котировки</button>
 
             <div id="result" class="result">
                 <h3>📈 Результат расчёта</h3>
@@ -361,11 +345,8 @@ HTML_TEMPLATE = '''
     </div>
 
     <script>
-        // Хранилище для силы команд из парсера
-        let teamStrengths = {
-            'Zenit': 90, 'Dinamo': 83, 'Lokomotiv': 86,
-            'Fakel': 79, 'Kuzbass': 80, 'Belogorie': 84
-        };
+        let teamsList = [];
+        let teamsData = {};
 
         async function parseTable() {
             const url = document.getElementById('tableUrl').value;
@@ -388,10 +369,11 @@ HTML_TEMPLATE = '''
                 const data = await response.json();
 
                 if (data.success) {
-                    teamStrengths = data.teams;
+                    teamsData = data.teams;
+                    teamsList = data.team_names;
                     displayParsedData(data.teams);
-                    updateTeamSelectors(data.teams);
-                    showStatus('✅ Таблица распарсена! Сила команд обновлена.', 'success');
+                    createTeamSelectors(data.teams, data.team_names);
+                    showStatus('✅ Таблица распарсена! Найдено команд: ' + data.team_names.length, 'success');
                 } else {
                     showStatus('❌ Ошибка: ' + data.error, 'error');
                 }
@@ -405,79 +387,94 @@ HTML_TEMPLATE = '''
 
         function displayParsedData(teams) {
             const container = document.getElementById('parsedData');
-            const names = {
-                'Zenit': '🏐 Зенит-Казань',
-                'Dinamo': '🏐 Динамо Москва',
-                'Lokomotiv': '🏐 Локомотив Новосибирск',
-                'Fakel': '🏐 Факел Ямал',
-                'Kuzbass': '🏐 Кузбасс Кемерово',
-                'Belogorie': '🏐 Белогорье Белгород'
-            };
             
-            let html = '<div style="font-weight: bold; margin-bottom: 15px;">📊 Распознанные данные из таблицы:</div>';
-            for (const [key, val] of Object.entries(teams)) {
-                const strength = typeof val === 'number' ? val : (val.strength || 80);
+            if (!teams || Object.keys(teams).length === 0) {
+                container.innerHTML = '<div style="color: #666;">⚠️ Не удалось распознать команды</div>';
+                container.classList.add('active');
+                return;
+            }
+            
+            let html = '<div style="font-weight: bold; margin-bottom: 15px;">📊 Распознанные команды из таблицы:</div>';
+            for (const [name, data] of Object.entries(teams)) {
+                const strength = data.strength || data.attack || 50;
                 html += `
                     <div class="team-strength">
-                        <span style="font-weight: bold;">${names[key] || key}</span>
+                        <span style="font-weight: bold; min-width: 200px;">🏐 ${name}</span>
                         <div class="strength-bar">
                             <div class="strength-fill" style="width: ${strength}%"></div>
                         </div>
-                        <span style="font-weight: bold; color: #28a745;">${strength.toFixed(1)}%</span>
+                        <span style="font-weight: bold; color: #28a745; min-width: 60px;">${strength.toFixed(1)}%</span>
                     </div>
                 `;
             }
-            html += '<div style="margin-top: 10px; font-size: 0.85em; color: #666;">✅ Данные загружены и применены к калькулятору</div>';
+            html += '<div style="margin-top: 10px; font-size: 0.85em; color: #666;">✅ Данные загружены. Выберите команды для расчёта.</div>';
             container.innerHTML = html;
             container.classList.add('active');
         }
 
-        function updateTeamSelectors(teams) {
-            const homeSelect = document.getElementById('homeTeam');
-            const awaySelect = document.getElementById('awayTeam');
+        function createTeamSelectors(teams, teamNames) {
+            const container = document.getElementById('teamSelectorsContainer');
+            const optionsPanel = document.getElementById('optionsPanel');
+            const calculateBtn = document.getElementById('calculateBtn');
             
-            // Обновляем текст опций с новой силой
-            for (let select of [homeSelect, awaySelect]) {
-                for (let i = 0; i < select.options.length; i++) {
-                    const option = select.options[i];
-                    const teamKey = option.value;
-                    const strength = teams[teamKey] || 80;
-                    const teamNames = {
-                        'Zenit': 'Зенит-Казань',
-                        'Dinamo': 'Динамо Москва',
-                        'Lokomotiv': 'Локомотив',
-                        'Fakel': 'Факел',
-                        'Kuzbass': 'Кузбасс',
-                        'Belogorie': 'Белогорье'
-                    };
-                    option.text = `${teamNames[teamKey]} (${Math.round(strength)}%)`;
-                }
+            if (!teamNames || teamNames.length < 2) {
+                container.innerHTML = '<div class="empty-state">⚠️ Найдено недостаточно команд (нужно минимум 2)</div>';
+                return;
             }
             
-            // Добавляем визуальный индикатор обновления
-            const teamsSection = document.getElementById('teamsSection');
-            teamsSection.classList.add('strength-updated');
-            setTimeout(() => {
-                teamsSection.classList.remove('strength-updated');
-            }, 2000);
+            // Создаём выпадающие списки
+            let optionsHtml = '';
+            for (let i = 0; i < teamNames.length; i++) {
+                const team = teamNames[i];
+                const strength = teams[team]?.strength || 50;
+                optionsHtml += `<option value="${i}">${team} (${strength.toFixed(1)}%)</option>`;
+            }
+            
+            container.innerHTML = `
+                <div class="team-selector">
+                    <div class="team-card">
+                        <label>🏠 Домашняя команда</label>
+                        <select id="homeTeam">
+                            ${optionsHtml}
+                        </select>
+                    </div>
+                    <div class="team-card">
+                        <label>✈️ Гостевая команда</label>
+                        <select id="awayTeam">
+                            ${optionsHtml}
+                        </select>
+                    </div>
+                </div>
+            `;
+            
+            optionsPanel.style.display = 'block';
+            calculateBtn.style.display = 'block';
         }
 
-        function getTeamStrength(teamKey) {
-            return teamStrengths[teamKey] || 80;
+        function getTeamStrength(teamIndex) {
+            const teamName = teamsList[teamIndex];
+            if (teamName && teamsData[teamName]) {
+                return teamsData[teamName].strength || teamsData[teamName].attack || 50;
+            }
+            return 50;
         }
 
         function calculateOdds() {
-            const homeTeam = document.getElementById('homeTeam').value;
-            const awayTeam = document.getElementById('awayTeam').value;
+            const homeIndex = parseInt(document.getElementById('homeTeam').value);
+            const awayIndex = parseInt(document.getElementById('awayTeam').value);
             const isNeutral = document.getElementById('neutralVenue').checked;
 
-            let homeStrength = getTeamStrength(homeTeam);
-            let awayStrength = getTeamStrength(awayTeam);
+            if (homeIndex === awayIndex) {
+                showStatus('❌ Выберите разные команды', 'error');
+                return;
+            }
 
-            // Бонус домашнего поля
-            const bonuses = { 'Zenit':1.15, 'Dinamo':1.10, 'Lokomotiv':1.12, 'Fakel':1.08, 'Kuzbass':1.09, 'Belogorie':1.11 };
+            let homeStrength = getTeamStrength(homeIndex);
+            let awayStrength = getTeamStrength(awayIndex);
+
+            // Бонус домашнего поля (стандартный 1.1)
             if (!isNeutral) {
-                homeStrength *= bonuses[homeTeam];
+                homeStrength *= 1.10;
             }
 
             // Расчёт вероятностей
@@ -504,13 +501,13 @@ HTML_TEMPLATE = '''
             // Рекомендация
             let recommendation = '';
             if (homeOdds > 1.5 && homeProb > 0.45) {
-                recommendation = '🎯 Ценность в ставке на хозяев (коэффициент выше вероятности)';
+                recommendation = '🎯 Ценность в ставке на хозяев';
             } else if (awayOdds > 2.0 && awayProb > 0.35) {
-                recommendation = '🎯 Ценность в ставке на гостей (хороший коэффициент)';
+                recommendation = '🎯 Ценность в ставке на гостей';
             } else if (homeOdds < 1.4 && homeProb > 0.7) {
-                recommendation = '📊 Фаворит очевиден, но коэффициент низкий';
+                recommendation = '📊 Фаворит очевиден';
             } else {
-                recommendation = '📊 Рекомендуется пари на фаворита или live-ставки';
+                recommendation = '📊 Равный матч, смотрите live';
             }
 
             // Отображение
@@ -552,12 +549,16 @@ def parse_table():
     if not url:
         return jsonify({'success': False, 'error': 'URL не указан'})
     
-    teams, error = parse_tournament_table(url)
+    teams_data, error, team_names = parse_tournament_table(url)
     
     if error:
         return jsonify({'success': False, 'error': error})
     
-    return jsonify({'success': True, 'teams': teams})
+    return jsonify({
+        'success': True, 
+        'teams': teams_data,
+        'team_names': team_names
+    })
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=10000)
