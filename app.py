@@ -5,11 +5,8 @@ import re
 
 app = Flask(__name__)
 
-# Пустая база команд - будет заполняться из таблицы
-TEAMS_DATABASE = {}
-
 def parse_tournament_table(url):
-    """Парсит турнирную таблицу и извлекает все команды с их показателями"""
+    """Парсит турнирную таблицу и извлекает только команды с правильным рейтингом"""
     try:
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
         response = requests.get(url, headers=headers, timeout=15)
@@ -25,35 +22,49 @@ def parse_tournament_table(url):
         
         teams_data = {}
         all_teams = []
+        team_positions = []  # Для хранения позиций команд
         
         # Парсим каждую таблицу
         for table in tables:
             rows = table.find_all('tr')
+            position = 1
             
             for row in rows:
                 cols = row.find_all('td')
                 if len(cols) >= 2:
-                    # Собираем текст всей строки
-                    row_text = ' '.join([c.get_text(strip=True) for c in cols])
-                    
-                    # Ищем название команды (обычно в первых колонках)
+                    # Ищем название команды
                     team_name = None
-                    for col in cols[:3]:  # Проверяем первые 3 колонки
+                    team_strength = None
+                    
+                    for col_idx, col in enumerate(cols[:4]):  # Проверяем первые 4 колонки
                         text = col.get_text(strip=True)
-                        # Фильтруем мусор (числа, короткие слова)
-                        if len(text) > 2 and not text.isdigit() and not text.replace('.', '').isdigit():
-                            if not any(x in text.lower() for x in ['команда', 'team', 'клуб', 'club', 'место', 'place', 'position']):
-                                team_name = text
+                        
+                        # Фильтруем мусор: убираем даты, времена, города, числа
+                        is_date = re.match(r'^\d{2}[:\.]\d{2}$|^\d{1,2}\.\d{1,2}\.\d{4}$|^\d{4}$', text)
+                        is_time = re.match(r'^\d{1,2}[:\.]\d{2}$', text)
+                        is_city = re.search(r'МСК|MCK|MSK', text)
+                        is_pure_number = text.isdigit() and len(text) <= 4
+                        is_garbage = len(text) < 3 and text.isdigit()
+                        
+                        if not is_date and not is_time and not is_city and not is_pure_number and not is_garbage:
+                            # Очищаем название от лишних символов
+                            clean_name = re.sub(r'[^\w\s\u0400-\u04FF-]', '', text).strip()
+                            clean_name = re.sub(r'\s+', ' ', clean_name)
+                            
+                            # Убираем слова-маркеры
+                            garbage_words = ['дата', 'time', 'date', 'место', 'position', 'rank', '№']
+                            if len(clean_name) > 2 and not any(gw in clean_name.lower() for gw in garbage_words):
+                                team_name = clean_name
                                 break
                     
-                    if team_name:
-                        # Ищем числовые показатели (очки, проценты)
-                        numbers = re.findall(r'(\d+(?:\.\d+)?)', row_text)
-                        strength = 50  # Значение по умолчанию
+                    if team_name and team_name not in all_teams:
+                        # Ищем числовые показатели в строке (очки, проценты)
+                        numbers = re.findall(r'(\d+(?:\.\d+)?)', row.get_text())
+                        strength = None
                         
                         for num in numbers:
                             val = float(num)
-                            # Определяем наиболее вероятный показатель силы
+                            # Нормализуем значение
                             if 0 < val <= 100:
                                 strength = val
                                 break
@@ -64,18 +75,28 @@ def parse_tournament_table(url):
                                 strength = min(100, val / 10)
                                 break
                         
-                        # Нормализуем название команды (убираем лишние символы)
-                        team_name = re.sub(r'[^\w\s\u0400-\u04FF-]', '', team_name).strip()
+                        # Если нет числовых показателей, используем позицию в таблице
+                        # Чем выше позиция (меньше число) - тем сильнее команда
+                        if strength is None:
+                            # Преобразуем позицию в силу (1 место = 95%, последнее = 50%)
+                            max_teams = 20  # Предполагаем максимум 20 команд
+                            strength = max(30, 95 - (position - 1) * (45 / max_teams))
                         
-                        if team_name and len(team_name) > 2:
-                            teams_data[team_name] = {
-                                'strength': round(strength, 1),
-                                'attack': round(strength, 1),
-                                'defense': round(max(30, strength - 10), 1),
-                                'homeBonus': 1.10,
-                                'name': team_name
-                            }
-                            all_teams.append(team_name)
+                        teams_data[team_name] = {
+                            'strength': round(strength, 1),
+                            'attack': round(strength, 1),
+                            'defense': round(max(30, strength - 10), 1),
+                            'homeBonus': 1.10,
+                            'name': team_name,
+                            'position': position
+                        }
+                        all_teams.append(team_name)
+                        team_positions.append(position)
+                        position += 1
+        
+        # Сортируем команды по силе (от сильных к слабым)
+        if teams_data:
+            all_teams.sort(key=lambda x: teams_data[x]['strength'], reverse=True)
         
         if not teams_data:
             return None, "Не удалось распознать команды в таблице", []
@@ -85,13 +106,12 @@ def parse_tournament_table(url):
     except Exception as e:
         return None, str(e), []
 
-# HTML с динамическими командами
 HTML_TEMPLATE = '''
 <!DOCTYPE html>
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
-    <title>Volley Odds - Динамический парсер</title>
+    <title>Volley Odds - Чистый парсер</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -159,6 +179,8 @@ HTML_TEMPLATE = '''
             border-radius: 8px;
             margin-top: 15px;
             display: none;
+            max-height: 300px;
+            overflow-y: auto;
         }
         .parsed-data.active { display: block; }
         .team-strength {
@@ -271,11 +293,18 @@ HTML_TEMPLATE = '''
         }
         .status.success { background: #d4edda; color: #155724; }
         .status.error { background: #f8d7da; color: #721c24; }
-        .status.info { background: #d1ecf1; color: #0c5460; }
         .empty-state {
             text-align: center;
             padding: 40px;
             color: #999;
+        }
+        .rank-badge {
+            background: #e0e0e0;
+            padding: 2px 8px;
+            border-radius: 12px;
+            font-size: 0.75em;
+            margin-left: 10px;
+            color: #666;
         }
         @media (max-width: 768px) {
             .team-selector, .odds-grid { grid-template-columns: 1fr; }
@@ -287,7 +316,7 @@ HTML_TEMPLATE = '''
     <div class="container">
         <div class="header">
             <h1>🏐 Volley Odds by Shtopor</h1>
-            <div>Динамический парсер турнирных таблиц</div>
+            <div>Чистый парсинг турнирных таблиц</div>
         </div>
         <div class="content">
             <div class="section">
@@ -373,12 +402,12 @@ HTML_TEMPLATE = '''
                     teamsList = data.team_names;
                     displayParsedData(data.teams);
                     createTeamSelectors(data.teams, data.team_names);
-                    showStatus('✅ Таблица распарсена! Найдено команд: ' + data.team_names.length, 'success');
+                    showStatus('✅ Найдено команд: ' + data.team_names.length, 'success');
                 } else {
                     showStatus('❌ Ошибка: ' + data.error, 'error');
                 }
             } catch (err) {
-                showStatus('❌ Ошибка соединения: ' + err.message, 'error');
+                showStatus('❌ Ошибка: ' + err.message, 'error');
             } finally {
                 btn.innerHTML = originalText;
                 btn.disabled = false;
@@ -394,12 +423,20 @@ HTML_TEMPLATE = '''
                 return;
             }
             
-            let html = '<div style="font-weight: bold; margin-bottom: 15px;">📊 Распознанные команды из таблицы:</div>';
-            for (const [name, data] of Object.entries(teams)) {
-                const strength = data.strength || data.attack || 50;
+            let html = '<div style="font-weight: bold; margin-bottom: 15px;">📊 Рейтинг команд (от сильных к слабым):</div>';
+            
+            // Сортируем по силе (от сильных к слабым)
+            const sortedTeams = Object.entries(teams).sort((a, b) => b[1].strength - a[1].strength);
+            
+            for (let i = 0; i < sortedTeams.length; i++) {
+                const [name, data] = sortedTeams[i];
+                const strength = data.strength;
+                const rank = i + 1;
                 html += `
                     <div class="team-strength">
-                        <span style="font-weight: bold; min-width: 200px;">🏐 ${name}</span>
+                        <span style="font-weight: bold; min-width: 200px;">
+                            ${rank}. 🏐 ${name}
+                        </span>
                         <div class="strength-bar">
                             <div class="strength-fill" style="width: ${strength}%"></div>
                         </div>
@@ -407,7 +444,6 @@ HTML_TEMPLATE = '''
                     </div>
                 `;
             }
-            html += '<div style="margin-top: 10px; font-size: 0.85em; color: #666;">✅ Данные загружены. Выберите команды для расчёта.</div>';
             container.innerHTML = html;
             container.classList.add('active');
         }
@@ -422,12 +458,16 @@ HTML_TEMPLATE = '''
                 return;
             }
             
-            // Создаём выпадающие списки
+            // Сортируем команды для выпадающего списка
+            const sortedTeams = [...teamNames].sort((a, b) => {
+                return teams[b].strength - teams[a].strength;
+            });
+            
             let optionsHtml = '';
-            for (let i = 0; i < teamNames.length; i++) {
-                const team = teamNames[i];
-                const strength = teams[team]?.strength || 50;
-                optionsHtml += `<option value="${i}">${team} (${strength.toFixed(1)}%)</option>`;
+            for (let i = 0; i < sortedTeams.length; i++) {
+                const team = sortedTeams[i];
+                const strength = teams[team].strength;
+                optionsHtml += `<option value="${team}">${team} (сила ${strength.toFixed(1)}%)</option>`;
             }
             
             container.innerHTML = `
@@ -451,28 +491,27 @@ HTML_TEMPLATE = '''
             calculateBtn.style.display = 'block';
         }
 
-        function getTeamStrength(teamIndex) {
-            const teamName = teamsList[teamIndex];
-            if (teamName && teamsData[teamName]) {
-                return teamsData[teamName].strength || teamsData[teamName].attack || 50;
+        function getTeamStrength(teamName) {
+            if (teamsData[teamName]) {
+                return teamsData[teamName].strength;
             }
             return 50;
         }
 
         function calculateOdds() {
-            const homeIndex = parseInt(document.getElementById('homeTeam').value);
-            const awayIndex = parseInt(document.getElementById('awayTeam').value);
+            const homeTeam = document.getElementById('homeTeam').value;
+            const awayTeam = document.getElementById('awayTeam').value;
             const isNeutral = document.getElementById('neutralVenue').checked;
 
-            if (homeIndex === awayIndex) {
+            if (homeTeam === awayTeam) {
                 showStatus('❌ Выберите разные команды', 'error');
                 return;
             }
 
-            let homeStrength = getTeamStrength(homeIndex);
-            let awayStrength = getTeamStrength(awayIndex);
+            let homeStrength = getTeamStrength(homeTeam);
+            let awayStrength = getTeamStrength(awayTeam);
 
-            // Бонус домашнего поля (стандартный 1.1)
+            // Бонус домашнего поля
             if (!isNeutral) {
                 homeStrength *= 1.10;
             }
@@ -490,7 +529,7 @@ HTML_TEMPLATE = '''
                 homeProb = 1 - drawProb - awayProb;
             }
 
-            // Коэффициенты с маржой 5%
+            // Коэффициенты
             const margin = 0.05;
             const homeOdds = (1 / homeProb) * (1 - margin);
             const drawOdds = (1 / drawProb) * (1 - margin);
@@ -498,19 +537,15 @@ HTML_TEMPLATE = '''
             
             const actualMargin = ((1/homeOdds + 1/drawOdds + 1/awayOdds) - 1) * 100;
 
-            // Рекомендация
             let recommendation = '';
             if (homeOdds > 1.5 && homeProb > 0.45) {
                 recommendation = '🎯 Ценность в ставке на хозяев';
             } else if (awayOdds > 2.0 && awayProb > 0.35) {
                 recommendation = '🎯 Ценность в ставке на гостей';
-            } else if (homeOdds < 1.4 && homeProb > 0.7) {
-                recommendation = '📊 Фаворит очевиден';
             } else {
-                recommendation = '📊 Равный матч, смотрите live';
+                recommendation = '📊 Фаворит очевиден';
             }
 
-            // Отображение
             document.getElementById('homeOdds').textContent = homeOdds.toFixed(2);
             document.getElementById('drawOdds').textContent = drawOdds.toFixed(2);
             document.getElementById('awayOdds').textContent = awayOdds.toFixed(2);
